@@ -3,17 +3,11 @@ import sys
 
 def main():
     print("Starting Javid Self Bot...")
-    bot = subprocess.Popen([sys.executable, "bot.py"], cwd="/app")
-    helper = subprocess.Popen([sys.executable, "helper.py"], cwd="/app")
-    
-    processes = [bot, helper]
-    
+    selfbot = subprocess.Popen([sys.executable, "self.py"], cwd="/app")
     try:
-        for p in processes:
-            p.wait()
+        selfbot.wait()
     except KeyboardInterrupt:
-        for p in processes:
-            p.terminate()
+        selfbot.terminate()
 
 if __name__ == "__main__":
     main()

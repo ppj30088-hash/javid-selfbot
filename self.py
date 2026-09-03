@@ -10,6 +10,7 @@ import os
 import sqlite3
 import tempfile
 import tempfile
+from telethon.sessions import StringSession
 from telethon.tl import functions, types
 from datetime import datetime, timedelta, timezone
 from telethon import connection
@@ -30,6 +31,10 @@ from telethon.tl.functions.photos import UploadProfilePhotoRequest, DeletePhotos
 api_id = 29481612
 api_hash = '01a41600f41fa58017c7220b954b7df8'
 session_name = 'selfbot'
+
+string_session = os.environ.get("STRING_SESSION")
+api_id_env = os.environ.get("API_ID")
+api_hash_env = os.environ.get("API_HASH")
 
 device_model = "Samsung Galaxy A52"
 system_version = "Android 13"
@@ -312,20 +317,33 @@ fonts = {
 }
 
 def random_font(text):
-    chosen_font_num = random.choice(fonts[8])
+    chosen_font_num = random.choice(list(fonts.keys()))
     return ''.join(fonts[chosen_font_num].get(ch, ch) for ch in text)
 
-client = TelegramClient(
-    session_name,
-    api_id,
-    api_hash,
-    device_model=device_model,
-    system_version=system_version,
-    app_version=app_version,
-    connection=connection.ConnectionTcpIntermediate,
-    lang_code=lang_code,
-    use_ipv6=True
-)
+if string_session:
+    client = TelegramClient(
+        StringSession(string_session),
+        int(api_id_env) if api_id_env else api_id,
+        api_hash_env if api_hash_env else api_hash,
+        device_model=device_model,
+        system_version=system_version,
+        app_version=app_version,
+        connection=connection.ConnectionTcpIntermediate,
+        lang_code=lang_code,
+        use_ipv6=False
+    )
+else:
+    client = TelegramClient(
+        session_name,
+        api_id,
+        api_hash,
+        device_model=device_model,
+        system_version=system_version,
+        app_version=app_version,
+        connection=connection.ConnectionTcpIntermediate,
+        lang_code=lang_code,
+        use_ipv6=False
+    )
 
 def to_tehran_time(dt):
     tehran_tz = pytz.timezone('Asia/Tehran')
