@@ -815,32 +815,7 @@ async def start_run_self_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
         
     now = datetime.now(timezone("Asia/Tehran"))
-    if not is_owner(user_id):
-        last_ts = LAST_RUNS.get(user_id)
-        if last_ts:
-            last_time = datetime.fromtimestamp(last_ts, tz=timezone("Asia/Tehran"))
-            if (now - last_time).total_seconds() < 86400:
-                await query.answer("شما امروز سلف ران کردید!", show_alert=True)
-                return ConversationHandler.END
-                
-        if NEXT_RUN_ALLOWED_AT and now < NEXT_RUN_ALLOWED_AT:
-            wait_minutes = int((NEXT_RUN_ALLOWED_AT - now).total_seconds() // 60)
-            wait_seconds = int((NEXT_RUN_ALLOWED_AT - now).total_seconds() % 60)
-            next_time = NEXT_RUN_ALLOWED_AT.strftime("%H:%M")
-            await query.answer(f"ربات استفاده شده تا {next_time} لطفا برای ران مجدد 00:{wait_minutes}:{wait_seconds:02d} دیگر صبر کنید!", show_alert=True)
-            return ConversationHandler.END
-            
 
-    if not is_owner(user_id) and RUNNING_USER and RUNNING_USER != user_id:
-        if RUN_STARTED_AT:
-            elapsed = (now - RUN_STARTED_AT).total_seconds()
-        else:
-            elapsed = 0
-        remaining = max(0, 300 - elapsed)
-        if remaining > 0:
-            await query.answer("شما ۵ دقیقه محدود شدید.", show_alert=True)
-            return ConversationHandler.END
-            
     await query.answer()
     RUNNING_USER = user_id
     RUN_STARTED_AT = now
